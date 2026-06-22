@@ -9,7 +9,7 @@ AGE_BINS = [0, 17, 24, 34, 44, 54, 64, 74, 200]
 AGE_LABELS = ["Under 18", "18–24", "25–34", "35–44", "45–54", "55–64", "65–74", "75+"]
 
 
-def build_scv(sheets: list[dict], reference_date: pd.Timestamp | None = None) -> tuple[pd.DataFrame, list[dict]]:
+def build_scv(sheets, reference_date=None):
     """
     sheets: list of {name, prefix, df}
     Returns (scv_df, column_specs)
@@ -52,8 +52,7 @@ def build_scv(sheets: list[dict], reference_date: pd.Timestamp | None = None) ->
     return scv, column_specs
 
 
-def _aggregate_sheet(df: pd.DataFrame, schema: dict, prefix: str, source: str,
-                     reference_date: pd.Timestamp) -> tuple[pd.DataFrame, list[dict]]:
+def _aggregate_sheet(df, schema, prefix, source, reference_date):
     agg: dict = {}
     specs: list[dict] = []
     cid = "Customer_ID"

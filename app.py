@@ -121,12 +121,17 @@ if uploaded:
             st.error("No valid sheets to process.")
             st.stop()
 
-        with st.spinner("Building SCV…"):
-            scv_df, column_specs = build_scv(dfs, reference_date=pd.Timestamp(ref_date))
-
-        st.session_state.scv_df = scv_df
-        st.session_state.column_specs = column_specs
-        st.session_state.step = 3
+        try:
+            with st.spinner("Building SCV…"):
+                scv_df, column_specs = build_scv(dfs, reference_date=pd.Timestamp(ref_date))
+            st.session_state.scv_df = scv_df
+            st.session_state.column_specs = column_specs
+            st.session_state.step = 3
+            st.rerun()
+        except Exception as e:
+            import traceback
+            st.error(f"Error building SCV: {e}")
+            st.code(traceback.format_exc())
 
 # ── Step 3: Schema preview ─────────────────────────────────────────────────────
 if st.session_state.step >= 3 and st.session_state.column_specs is not None:

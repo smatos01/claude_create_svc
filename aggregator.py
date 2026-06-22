@@ -7,6 +7,12 @@ from detector import infer_schema, city_to_region
 
 AGE_BINS = [0, 17, 24, 34, 44, 54, 64, 74, 200]
 AGE_LABELS = ["Under 18", "18–24", "25–34", "35–44", "45–54", "55–64", "65–74", "75+"]
+CATEGORICAL_FLAG_MAX_UNIQUE = 5
+
+
+def _is_customer_level(df):
+    """True if Customer_ID is already unique in this sheet — no aggregation needed."""
+    return df["Customer_ID"].nunique() == len(df)
 
 
 def build_scv(sheets, reference_date=None):
@@ -30,7 +36,8 @@ def build_scv(sheets, reference_date=None):
             continue
 
         schema = infer_schema(df, name)
-        agg_df, specs = _aggregate_sheet(df, schema, prefix, name, reference_date)
+        customer_level = _is_customer_level(df)
+        agg_df, specs = _aggregate_sheet(df, schema, prefix, name, reference_date, customer_level)
         per_sheet_frames.append(agg_df)
         column_specs.extend(specs)
 
@@ -52,9 +59,9 @@ def build_scv(sheets, reference_date=None):
     return scv, column_specs
 
 
-def _aggregate_sheet(df, schema, prefix, source, reference_date):
-    agg: dict = {}
-    specs: list[dict] = []
+def _aggregate_sheet(df, schema, prefix, source, reference_date, customer_level=False):
+    agg = {}
+    specs = []
     cid = "Customer_ID"
 
     for col, ftype in schema.items():
@@ -62,18 +69,43 @@ def _aggregate_sheet(df, schema, prefix, source, reference_date):
             continue
         col_data = df[[cid, col]].copy()
 
+        # ── Customer-level sheet: carry columns as-is, only derive from dates ──
+        if customer_level:
+            if ftype == "date":
+                # fall through to date handling below
+                pass
+            elif ftype == "numeric":
+                col_clean = _clean_name(col)
+                out_col = f"{prefix}{col_clean}"
+                agg[out_col] = col_data.set_index(cid)[col]
+                specs.append({"column": out_col, "source": source, "derivation": f"{col} (as-is)"})
+                # Bucketing only — no aggregation stats
+                if re.search(r"(salary|income|spend|revenue|value|amount|age)", col, re.I):
+                    bucket_col = f"{prefix}{col_clean}_Band"
+                    try:
+                        banded = pd.qcut(col_data[col], q=3, labels=["Low", "Medium", "High"], duplicates="drop")
+                    except Exception:
+                        banded = pd.Series("Unknown", index=col_data.index)
+                    banded.index = col_data[cid]
+                    agg[bucket_col] = banded
+                    specs.append({"column": bucket_col, "source": source, "derivation": f"Percentile band of {col}"})
+                continue
+            else:
+                col_clean = _clean_name(col)
+                out_col = f"{prefix}{col_clean}"
+                agg[out_col] = col_data.set_index(cid)[col]
+                specs.append({"column": out_col, "source": source, "derivation": f"{col} (as-is)"})
+                continue
+
+        # ── Transaction-level sheet: full aggregation ──
         if ftype == "id":
             out_col = f"{prefix}Count_{col}"
-            result = col_data.groupby(cid)[col].nunique().rename(out_col)
-            agg[out_col] = result
+            agg[out_col] = col_data.groupby(cid)[col].nunique()
             specs.append({"column": out_col, "source": source, "derivation": f"Count distinct {col}"})
 
         elif ftype == "numeric":
-            numeric_series = pd.to_numeric(col_data[col], errors="coerce")
-            col_data = col_data.copy()
-            col_data[col] = numeric_series
+            col_data[col] = pd.to_numeric(col_data[col], errors="coerce")
             grp = col_data.groupby(cid)[col]
-
             col_clean = _clean_name(col)
             for stat, series in [
                 (f"{prefix}Avg_{col_clean}", grp.mean()),
@@ -84,32 +116,31 @@ def _aggregate_sheet(df, schema, prefix, source, reference_date):
                 agg[stat] = series
                 specs.append({"column": stat, "source": source, "derivation": f"{stat.split('_')[1]} of {col}"})
 
-            # Bucketing for salary / income / spend fields
             if re.search(r"(salary|income|spend|revenue|value|amount)", col, re.I):
                 bucket_col = f"{prefix}{col_clean}_Band"
-                agg_bucket = col_data.groupby(cid)[col].mean()
                 try:
-                    banded = pd.qcut(agg_bucket, q=3, labels=["Low", "Medium", "High"], duplicates="drop")
+                    banded = pd.qcut(grp.mean(), q=3, labels=["Low", "Medium", "High"], duplicates="drop")
                 except Exception:
-                    banded = pd.Series("Unknown", index=agg_bucket.index)
+                    banded = pd.Series("Unknown", index=grp.mean().index)
                 agg[bucket_col] = banded
                 specs.append({"column": bucket_col, "source": source, "derivation": f"Percentile band of {col}"})
 
         elif ftype == "categorical":
             col_clean = _clean_name(col)
             grp = col_data.groupby(cid)[col]
+            n_unique = col_data[col].dropna().nunique()
 
             count_distinct_col = f"{prefix}Count_Distinct_{col_clean}"
             agg[count_distinct_col] = grp.nunique()
             specs.append({"column": count_distinct_col, "source": source,
                           "derivation": f"Count distinct {col}"})
 
-            unique_vals = col_data[col].dropna().unique()
-            for val in sorted(str(v) for v in unique_vals):
-                flag_col = f"{prefix}Has_{col_clean}_{_clean_name(val)}"
-                flag = col_data.groupby(cid)[col].apply(lambda s, v=val: (s.astype(str) == v).any()).astype(int)
-                agg[flag_col] = flag
-                specs.append({"column": flag_col, "source": source, "derivation": f"Flag: {col}={val}"})
+            if n_unique <= CATEGORICAL_FLAG_MAX_UNIQUE:
+                for val in sorted(str(v) for v in col_data[col].dropna().unique()):
+                    flag_col = f"{prefix}Has_{col_clean}_{_clean_name(val)}"
+                    flag = grp.apply(lambda s, v=val: (s.astype(str) == v).any()).astype(int)
+                    agg[flag_col] = flag
+                    specs.append({"column": flag_col, "source": source, "derivation": f"Flag: {col}={val}"})
 
         elif ftype == "geo":
             col_clean = _clean_name(col)
@@ -125,17 +156,32 @@ def _aggregate_sheet(df, schema, prefix, source, reference_date):
         elif ftype == "date":
             col_clean = _clean_name(col)
             col_data[col] = pd.to_datetime(col_data[col], errors="coerce")
-            grp = col_data.groupby(cid)[col]
 
             dob_like = bool(re.search(r"(dob|birth)", col, re.I))
             visit_like = bool(re.search(r"(visit|session|login|view)", col, re.I))
 
+            if customer_level:
+                # For already-aggregated sheets: derive from the single date value per customer
+                date_series = col_data.set_index(cid)[col]
+                if dob_like:
+                    age_col = f"{prefix}Age_Years"
+                    agg[age_col] = ((reference_date - date_series).dt.days / 365.25).round(1)
+                    specs.append({"column": age_col, "source": source, "derivation": f"Age in years from {col}"})
+                    age_band_col = f"{prefix}Age_Band"
+                    agg[age_band_col] = pd.cut(agg[age_col], bins=AGE_BINS, labels=AGE_LABELS, right=True)
+                    specs.append({"column": age_band_col, "source": source, "derivation": "Age band"})
+                else:
+                    last_col = f"{prefix}Days_Since_{col_clean}"
+                    agg[last_col] = (reference_date - date_series).dt.days
+                    specs.append({"column": last_col, "source": source, "derivation": f"Days since {col}"})
+                continue
+
+            grp = col_data.groupby(cid)[col]
+
             if dob_like:
                 age_col = f"{prefix}Age_Years"
-                latest_dob = grp.max()
-                agg[age_col] = ((reference_date - latest_dob).dt.days / 365.25).round(1)
+                agg[age_col] = ((reference_date - grp.max()).dt.days / 365.25).round(1)
                 specs.append({"column": age_col, "source": source, "derivation": f"Age in years from {col}"})
-
                 age_band_col = f"{prefix}Age_Band"
                 agg[age_band_col] = pd.cut(agg[age_col], bins=AGE_BINS, labels=AGE_LABELS, right=True)
                 specs.append({"column": age_band_col, "source": source, "derivation": "Age band"})
@@ -149,8 +195,8 @@ def _aggregate_sheet(df, schema, prefix, source, reference_date):
 
                 agg[active_days_col] = grp.apply(lambda s: s.dropna().dt.date.nunique())
                 agg[visits_col] = grp.count()
-                specs.append({"column": active_days_col, "source": source, "derivation": f"Distinct active days"})
-                specs.append({"column": visits_col, "source": source, "derivation": f"Total visit count"})
+                specs.append({"column": active_days_col, "source": source, "derivation": "Distinct active days"})
+                specs.append({"column": visits_col, "source": source, "derivation": "Total visit count"})
 
                 hour_data = col_data.copy()
                 hour_data["_hour"] = col_data[col].dt.hour
@@ -164,13 +210,10 @@ def _aggregate_sheet(df, schema, prefix, source, reference_date):
                     specs.append({"column": c, "source": source, "derivation": d})
 
             else:
-                # Generic transaction / event date
                 last_col = f"{prefix}Days_Since_Last_{col_clean}"
                 first_col = f"{prefix}Tenure_Days_{col_clean}"
-                last_date = grp.max()
-                first_date = grp.min()
-                agg[last_col] = (reference_date - last_date).dt.days
-                agg[first_col] = (reference_date - first_date).dt.days
+                agg[last_col] = (reference_date - grp.max()).dt.days
+                agg[first_col] = (reference_date - grp.min()).dt.days
                 specs.append({"column": last_col, "source": source, "derivation": f"Days since last {col}"})
                 specs.append({"column": first_col, "source": source, "derivation": f"Tenure days since first {col}"})
 
@@ -191,7 +234,7 @@ def _aggregate_sheet(df, schema, prefix, source, reference_date):
     return result, specs
 
 
-def _resolve_conflicts(df: pd.DataFrame) -> pd.DataFrame:
+def _resolve_conflicts(df):
     """Drop _x/_y duplicates by keeping the non-null value (prefer _x)."""
     cols_x = [c for c in df.columns if c.endswith("_x")]
     for cx in cols_x:
@@ -207,7 +250,7 @@ def _clean_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", str(s)).strip("_")
 
 
-def apply_column_selection(df: pd.DataFrame, column_specs: list[dict]) -> pd.DataFrame:
+def apply_column_selection(df, column_specs):
     """Filter df to only included columns."""
     keep = {"Customer_ID"} | {s["column"] for s in column_specs if s.get("include", True)}
     cols = [c for c in df.columns if c in keep]

@@ -90,6 +90,17 @@ def _aggregate_sheet(df, schema, prefix, source, reference_date, customer_level=
                     agg[bucket_col] = banded
                     specs.append({"column": bucket_col, "source": source, "derivation": f"Percentile band of {col}"})
                 continue
+            elif ftype == "geo":
+                col_clean = _clean_name(col)
+                # Carry city as-is
+                out_col = f"{prefix}{col_clean}"
+                agg[out_col] = col_data.set_index(cid)[col]
+                specs.append({"column": out_col, "source": source, "derivation": f"{col} (as-is)"})
+                # Derive region
+                region_col = f"{prefix}Region"
+                agg[region_col] = col_data.set_index(cid)[col].apply(city_to_region)
+                specs.append({"column": region_col, "source": source, "derivation": f"UK Region from {col}"})
+                continue
             else:
                 col_clean = _clean_name(col)
                 out_col = f"{prefix}{col_clean}"

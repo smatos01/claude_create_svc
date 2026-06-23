@@ -1,6 +1,7 @@
 """SCV Builder — Single Customer View builder from multi-sheet Excel files."""
 
 import io
+import traceback
 import pandas as pd
 import streamlit as st
 from aggregator import build_scv, apply_column_selection
@@ -31,7 +32,6 @@ st.markdown("""
     font-weight: bold;
     margin-right: 8px;
   }
-  .spec-table th { background: #f0f4ff; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -43,107 +43,140 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state init ─────────────────────────────────────────────────────────
-for key in ("sheets_config", "scv_df", "column_specs", "step"):
+for key in ("scv_df", "column_specs", "built"):
     if key not in st.session_state:
-        st.session_state[key] = None if key != "step" else 1
+        st.session_state[key] = None
+if "built" not in st.session_state:
+    st.session_state.built = False
+
+
+def _normalise_cols(df):
+    """Strip whitespace from column names and normalise Customer_ID spelling."""
+    df.columns = [str(c).strip() for c in df.columns]
+    # Accept common variations: customer_id, CustomerID, customerid, etc.
+    for col in df.columns:
+        if col.lower().replace(" ", "").replace("_", "") == "customerid":
+            df = df.rename(columns={col: "Customer_ID"})
+            break
+    return df
+
 
 # ── Step 1: Upload ─────────────────────────────────────────────────────────────
 st.markdown("### <span class='step-badge'>1</span> Upload your Excel file", unsafe_allow_html=True)
 uploaded = st.file_uploader(
-    "Each sheet will be treated as a separate data source. All sheets must contain a **Customer_ID** column.",
+    "Each sheet will be treated as a separate data source. "
+    "All sheets must contain a **Customer_ID** column (any capitalisation).",
     type=["xlsx", "xls"],
     label_visibility="visible",
 )
 
-if uploaded:
-    try:
-        xl = pd.ExcelFile(io.BytesIO(uploaded.read()))
-    except Exception as e:
-        st.error(f"Could not read the Excel file: {e}")
-        st.stop()
+if not uploaded:
+    st.stop()
 
-    sheet_names = xl.sheet_names
-    if not sheet_names:
-        st.warning("The uploaded file has no sheets.")
-        st.stop()
+try:
+    file_bytes = uploaded.read()
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+except Exception as e:
+    st.error(f"Could not read the Excel file: {e}")
+    st.stop()
 
-    # ── Step 2: Configure sheets ───────────────────────────────────────────────
-    st.markdown("### <span class='step-badge'>2</span> Configure data sources", unsafe_allow_html=True)
-    st.caption("Assign a prefix for each sheet. Columns in the SCV will be prefixed accordingly.")
+sheet_names = xl.sheet_names
+if not sheet_names:
+    st.warning("The uploaded file has no sheets.")
+    st.stop()
 
-    DEFAULT_PREFIXES = ["TXN_", "CRM_", "WEB_", "PROD_", "SRVC_", "MKTG_"]
+# ── Step 2: Configure sheets ───────────────────────────────────────────────────
+st.markdown("### <span class='step-badge'>2</span> Configure data sources", unsafe_allow_html=True)
+st.caption("Assign a prefix for each sheet. Columns in the SCV will be prefixed accordingly.")
 
-    sheets_config = []
-    cols = st.columns(min(len(sheet_names), 3))
-    for i, sname in enumerate(sheet_names):
-        with cols[i % len(cols)]:
-            st.markdown(f"**{sname}**")
-            default_prefix = DEFAULT_PREFIXES[i] if i < len(DEFAULT_PREFIXES) else f"SRC{i+1}_"
-            prefix = st.text_input(
-                f"Prefix for '{sname}'",
-                value=default_prefix,
-                key=f"prefix_{sname}",
-                label_visibility="collapsed",
-                placeholder="e.g. TXN_",
-            )
-            include = st.checkbox(f"Include sheet", value=True, key=f"include_{sname}")
-            if include:
-                sheets_config.append({"name": sname, "prefix": prefix})
+DEFAULT_PREFIXES = ["TXN_", "CRM_", "WEB_", "PROD_", "SRVC_", "MKTG_"]
 
-    if not sheets_config:
-        st.warning("Please include at least one sheet.")
-        st.stop()
+# Show sheet preview (column names) so user can verify Customer_ID column
+with st.expander("Sheet column preview", expanded=False):
+    for sname in sheet_names:
+        try:
+            preview = xl.parse(sname, nrows=0)
+            preview = _normalise_cols(preview)
+            has_cid = "Customer_ID" in preview.columns
+            icon = "✅" if has_cid else "⚠️"
+            st.markdown(f"**{icon} {sname}**: {', '.join(preview.columns.tolist())}")
+        except Exception:
+            st.markdown(f"**{sname}**: could not read")
 
-    # Reference date for age / recency calculations
-    ref_date = st.date_input(
-        "Reference date (used for recency / age calculations)",
-        value=pd.Timestamp.now().date(),
-    )
+sheets_config = []
+cols_ui = st.columns(min(len(sheet_names), 3))
+for i, sname in enumerate(sheet_names):
+    with cols_ui[i % len(cols_ui)]:
+        st.markdown(f"**{sname}**")
+        default_prefix = DEFAULT_PREFIXES[i] if i < len(DEFAULT_PREFIXES) else f"SRC{i+1}_"
+        prefix = st.text_input(
+            f"Prefix for '{sname}'",
+            value=default_prefix,
+            key=f"prefix_{sname}",
+            label_visibility="collapsed",
+            placeholder="e.g. TXN_",
+        )
+        include = st.checkbox("Include sheet", value=True, key=f"include_{sname}")
+        if include:
+            sheets_config.append({"name": sname, "prefix": prefix})
 
-    if st.button("▶ Build SCV preview", type="primary"):
-        dfs = []
-        errors = []
-        for cfg in sheets_config:
-            try:
-                df = xl.parse(cfg["name"])
-                df.columns = [str(c).strip() for c in df.columns]
-                if "Customer_ID" not in df.columns:
-                    errors.append(f"Sheet **{cfg['name']}** has no Customer_ID column — skipped.")
-                else:
-                    dfs.append({**cfg, "df": df})
-            except Exception as e:
-                errors.append(f"Error reading sheet **{cfg['name']}**: {e}")
+if not sheets_config:
+    st.warning("Please include at least one sheet.")
+    st.stop()
 
-        for err in errors:
-            st.warning(err)
+ref_date = st.date_input(
+    "Reference date (used for recency / age calculations)",
+    value=pd.Timestamp.now().date(),
+)
 
-        if not dfs:
-            st.error("No valid sheets to process.")
-            st.stop()
+# ── Button ─────────────────────────────────────────────────────────────────────
+if st.button("▶ Build SCV preview", type="primary"):
+    st.session_state.built = False
+    st.session_state.scv_df = None
+    st.session_state.column_specs = None
 
+    dfs = []
+    build_errors = []
+
+    for cfg in sheets_config:
+        try:
+            df = xl.parse(cfg["name"])
+            df = _normalise_cols(df)
+            if "Customer_ID" not in df.columns:
+                build_errors.append(
+                    f"⚠️ Sheet **{cfg['name']}** skipped — no Customer_ID column found. "
+                    f"Columns present: {', '.join(df.columns.tolist())}"
+                )
+            else:
+                dfs.append({**cfg, "df": df})
+        except Exception as e:
+            build_errors.append(f"❌ Error reading sheet **{cfg['name']}**: {e}")
+
+    for err in build_errors:
+        st.warning(err)
+
+    if not dfs:
+        st.error("No sheets with a Customer_ID column found. Check the preview above to see your column names.")
+    else:
         try:
             with st.spinner("Building SCV…"):
                 scv_df, column_specs = build_scv(dfs, reference_date=pd.Timestamp(ref_date))
             st.session_state.scv_df = scv_df
             st.session_state.column_specs = column_specs
-            st.session_state.step = 3
+            st.session_state.built = True
             st.rerun()
         except Exception as e:
-            import traceback
             st.error(f"Error building SCV: {e}")
             st.code(traceback.format_exc())
 
 # ── Step 3: Schema preview ─────────────────────────────────────────────────────
-if st.session_state.step >= 3 and st.session_state.column_specs is not None:
+if st.session_state.built and st.session_state.column_specs:
     st.markdown("### <span class='step-badge'>3</span> Review output schema", unsafe_allow_html=True)
     st.caption(
-        "The table below shows every column that will appear in the SCV. "
         "Un-tick any columns you want to exclude before downloading."
     )
 
     specs = st.session_state.column_specs
-
-    # Group by source for a cleaner UI
     sources = sorted({s["source"] for s in specs})
     updated_specs = []
 
@@ -170,18 +203,12 @@ if st.session_state.step >= 3 and st.session_state.column_specs is not None:
 
     included_count = sum(1 for s in updated_specs if s.get("include", True))
     scv_rows = len(st.session_state.scv_df)
-    st.info(
-        f"Output: **{scv_rows:,} customers** × **{included_count + 1} columns** "
-        f"(including Customer_ID)"
-    )
+    st.info(f"Output: **{scv_rows:,} customers** × **{included_count + 1} columns** (including Customer_ID)")
 
     # ── Step 4: Preview & download ─────────────────────────────────────────────
     st.markdown("### <span class='step-badge'>4</span> Preview & download", unsafe_allow_html=True)
 
-    final_df = apply_column_selection(
-        st.session_state.scv_df, st.session_state.column_specs
-    )
-
+    final_df = apply_column_selection(st.session_state.scv_df, st.session_state.column_specs)
     st.dataframe(final_df.head(100), use_container_width=True, height=350)
     if len(final_df) > 100:
         st.caption(f"Showing first 100 of {len(final_df):,} rows.")

@@ -9,28 +9,18 @@ from exporter import to_excel_bytes
 
 st.set_page_config(page_title="SCV Builder", page_icon="🧩", layout="wide")
 
-# ── Styles ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
   .title-banner {
     background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-    padding: 2rem 2.5rem;
-    border-radius: 12px;
-    margin-bottom: 2rem;
-    color: white;
+    padding: 2rem 2.5rem; border-radius: 12px; margin-bottom: 2rem; color: white;
   }
   .title-banner h1 { margin: 0; font-size: 2.2rem; }
   .title-banner p  { margin: 0.4rem 0 0; opacity: 0.8; font-size: 1rem; }
   .step-badge {
-    display: inline-block;
-    background: #0f3460;
-    color: white;
-    border-radius: 50%;
-    width: 28px; height: 28px;
-    line-height: 28px;
-    text-align: center;
-    font-weight: bold;
-    margin-right: 8px;
+    display: inline-block; background: #0f3460; color: white;
+    border-radius: 50%; width: 28px; height: 28px; line-height: 28px;
+    text-align: center; font-weight: bold; margin-right: 8px;
   }
 </style>
 """, unsafe_allow_html=True)
@@ -43,23 +33,77 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state init ─────────────────────────────────────────────────────────
-for key in ("scv_df", "column_specs", "built"):
+for key, default in [("scv_df", None), ("column_specs", None), ("built", False)]:
     if key not in st.session_state:
-        st.session_state[key] = None
-if "built" not in st.session_state:
-    st.session_state.built = False
+        st.session_state[key] = default
 
 
 def _normalise_cols(df):
-    """Strip whitespace from column names and normalise Customer_ID spelling."""
     df.columns = [str(c).strip() for c in df.columns]
-    # Accept common variations: customer_id, CustomerID, customerid, etc.
     for col in df.columns:
         if col.lower().replace(" ", "").replace("_", "") == "customerid":
             df = df.rename(columns={col: "Customer_ID"})
             break
     return df
 
+
+# ── Steps 3 & 4: always render from session state if available ─────────────────
+# Placed BEFORE the upload gate so st.stop() on missing file doesn't hide results.
+if st.session_state.built and st.session_state.column_specs:
+    st.markdown("### <span class='step-badge'>3</span> Review output schema", unsafe_allow_html=True)
+    st.caption("Un-tick any columns you want to exclude before downloading.")
+
+    specs = st.session_state.column_specs
+    sources = sorted({s["source"] for s in specs})
+    updated_specs = []
+
+    for src in sources:
+        src_specs = [s for s in specs if s["source"] == src]
+        with st.expander(f"**{src}** — {len(src_specs)} columns", expanded=True):
+            col_a, col_b, col_c = st.columns([3, 4, 1])
+            col_a.markdown("**Column name**")
+            col_b.markdown("**Derivation**")
+            col_c.markdown("**Include**")
+            for spec in src_specs:
+                ca, cb, cc = st.columns([3, 4, 1])
+                ca.code(spec["column"], language=None)
+                cb.caption(spec["derivation"])
+                included = cc.checkbox(
+                    "include",
+                    value=spec.get("include", True),
+                    key=f"inc_{spec['column']}",
+                    label_visibility="collapsed",
+                )
+                updated_specs.append({**spec, "include": included})
+
+    st.session_state.column_specs = updated_specs
+    included_count = sum(1 for s in updated_specs if s.get("include", True))
+    scv_rows = len(st.session_state.scv_df)
+    st.info(f"Output: **{scv_rows:,} customers** × **{included_count + 1} columns** (including Customer_ID)")
+
+    st.markdown("### <span class='step-badge'>4</span> Preview & download", unsafe_allow_html=True)
+    final_df = apply_column_selection(st.session_state.scv_df, st.session_state.column_specs)
+    st.dataframe(final_df.head(100), use_container_width=True, height=350)
+    if len(final_df) > 100:
+        st.caption(f"Showing first 100 of {len(final_df):,} rows.")
+
+    excel_bytes = to_excel_bytes(final_df)
+    st.download_button(
+        label="⬇ Download SCV as Excel",
+        data=excel_bytes,
+        file_name="single_customer_view.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+
+    st.divider()
+    if st.button("🔄 Start over with a new file"):
+        for key in ("scv_df", "column_specs", "built"):
+            st.session_state[key] = None if key != "built" else False
+        st.rerun()
+
+    # Don't show upload/config UI once results are displayed
+    st.stop()
 
 # ── Step 1: Upload ─────────────────────────────────────────────────────────────
 st.markdown("### <span class='step-badge'>1</span> Upload your Excel file", unsafe_allow_html=True)
@@ -74,8 +118,7 @@ if not uploaded:
     st.stop()
 
 try:
-    file_bytes = uploaded.read()
-    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    xl = pd.ExcelFile(io.BytesIO(uploaded.read()))
 except Exception as e:
     st.error(f"Could not read the Excel file: {e}")
     st.stop()
@@ -91,14 +134,11 @@ st.caption("Assign a prefix for each sheet. Columns in the SCV will be prefixed 
 
 DEFAULT_PREFIXES = ["TXN_", "CRM_", "WEB_", "PROD_", "SRVC_", "MKTG_"]
 
-# Show sheet preview (column names) so user can verify Customer_ID column
 with st.expander("Sheet column preview", expanded=False):
     for sname in sheet_names:
         try:
-            preview = xl.parse(sname, nrows=0)
-            preview = _normalise_cols(preview)
-            has_cid = "Customer_ID" in preview.columns
-            icon = "✅" if has_cid else "⚠️"
+            preview = _normalise_cols(xl.parse(sname, nrows=0))
+            icon = "✅" if "Customer_ID" in preview.columns else "⚠️"
             st.markdown(f"**{icon} {sname}**: {', '.join(preview.columns.tolist())}")
         except Exception:
             st.markdown(f"**{sname}**: could not read")
@@ -131,21 +171,16 @@ ref_date = st.date_input(
 
 # ── Button ─────────────────────────────────────────────────────────────────────
 if st.button("▶ Build SCV preview", type="primary"):
-    st.session_state.built = False
-    st.session_state.scv_df = None
-    st.session_state.column_specs = None
-
     dfs = []
     build_errors = []
 
     for cfg in sheets_config:
         try:
-            df = xl.parse(cfg["name"])
-            df = _normalise_cols(df)
+            df = _normalise_cols(xl.parse(cfg["name"]))
             if "Customer_ID" not in df.columns:
                 build_errors.append(
                     f"⚠️ Sheet **{cfg['name']}** skipped — no Customer_ID column found. "
-                    f"Columns present: {', '.join(df.columns.tolist())}"
+                    f"Columns present: `{', '.join(df.columns.tolist())}`"
                 )
             else:
                 dfs.append({**cfg, "df": df})
@@ -156,7 +191,10 @@ if st.button("▶ Build SCV preview", type="primary"):
         st.warning(err)
 
     if not dfs:
-        st.error("No sheets with a Customer_ID column found. Check the preview above to see your column names.")
+        st.error(
+            "No sheets with a Customer_ID column found. "
+            "Open the **Sheet column preview** above to see your exact column names."
+        )
     else:
         try:
             with st.spinner("Building SCV…"):
@@ -168,56 +206,3 @@ if st.button("▶ Build SCV preview", type="primary"):
         except Exception as e:
             st.error(f"Error building SCV: {e}")
             st.code(traceback.format_exc())
-
-# ── Step 3: Schema preview ─────────────────────────────────────────────────────
-if st.session_state.built and st.session_state.column_specs:
-    st.markdown("### <span class='step-badge'>3</span> Review output schema", unsafe_allow_html=True)
-    st.caption(
-        "Un-tick any columns you want to exclude before downloading."
-    )
-
-    specs = st.session_state.column_specs
-    sources = sorted({s["source"] for s in specs})
-    updated_specs = []
-
-    for src in sources:
-        src_specs = [s for s in specs if s["source"] == src]
-        with st.expander(f"**{src}** — {len(src_specs)} columns", expanded=True):
-            col_a, col_b, col_c = st.columns([3, 4, 1])
-            col_a.markdown("**Column name**")
-            col_b.markdown("**Derivation**")
-            col_c.markdown("**Include**")
-            for spec in src_specs:
-                ca, cb, cc = st.columns([3, 4, 1])
-                ca.code(spec["column"], language=None)
-                cb.caption(spec["derivation"])
-                included = cc.checkbox(
-                    "include",
-                    value=spec.get("include", True),
-                    key=f"inc_{spec['column']}",
-                    label_visibility="collapsed",
-                )
-                updated_specs.append({**spec, "include": included})
-
-    st.session_state.column_specs = updated_specs
-
-    included_count = sum(1 for s in updated_specs if s.get("include", True))
-    scv_rows = len(st.session_state.scv_df)
-    st.info(f"Output: **{scv_rows:,} customers** × **{included_count + 1} columns** (including Customer_ID)")
-
-    # ── Step 4: Preview & download ─────────────────────────────────────────────
-    st.markdown("### <span class='step-badge'>4</span> Preview & download", unsafe_allow_html=True)
-
-    final_df = apply_column_selection(st.session_state.scv_df, st.session_state.column_specs)
-    st.dataframe(final_df.head(100), use_container_width=True, height=350)
-    if len(final_df) > 100:
-        st.caption(f"Showing first 100 of {len(final_df):,} rows.")
-
-    excel_bytes = to_excel_bytes(final_df)
-    st.download_button(
-        label="⬇ Download SCV as Excel",
-        data=excel_bytes,
-        file_name="single_customer_view.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
